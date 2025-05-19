@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+
+set -e
+
+# Function for debug logging
+debug_log() {
+  if [[ -n "${DATORIA_LAUNCHER_DEBUG+x}" ]]; then
+    echo "$@" >&2
+  fi
+}
+
+# Function to find datoria-config.json in current or parent directories
+find_config_file() {
+  local current_dir="${PWD}"
+  
+  while [[ "${current_dir}" != "/" ]]; do
+    local config_path="${current_dir}/datoria-config.json"
+    if [[ -f "${config_path}" ]]; then
+      debug_log "Found config file at: ${config_path}"
+      echo "${config_path}"
+      return 0
+    fi
+    # Move up to parent directory
+    current_dir="$(dirname "${current_dir}")"
+  done
+  
+  # Explicitly return empty string when no file is found
+  debug_log "No config file found in directory hierarchy"
+  echo ""
+  return 1
+}
+
+# Function to extract version from config file
+extract_version_from_config() {
+  local config_file="$1"
+  local version
+  local content
+
+  # Parse JSON using a simple approach that works in bash
+  if command -v grep >/dev/null && command -v sed >/dev/null; then
+    # First attempt with grep/sed that handles whitespace better
+    version=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "${config_file}" | sed 's/"version"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/')
+    if [[ -n "${version}" ]]; then
+      debug_log "Extracted version ${version} using grep/sed"
+      echo "${version}"
+      return 0
+    fi
+  fi
+
+  # Fallback to a more basic parsing approach
+  content=$(cat "${config_file}")
+  if [[ "${content}" =~ \"version\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+    debug_log "Extracted version ${BASH_REMATCH[1]} using regex"
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  # If we get here, we couldn't extract the version
+  debug_log "Could not extract version from config file"
+  return 1
+}
+
+# Function to fetch latest version from endpoint
+fetch_latest_version() {
+  debug_log "Fetching latest version from release.datoria.no..."
+
+  # Set a timeout for curl
+  local timeout_seconds=30
+  local max_retries=3
+  local retry_count=0
+  local latest_version=""
+  local http_code
+
+  while [[ "${retry_count}" -lt "${max_retries}" ]]; do
+    http_code=$(curl -s -L -o /tmp/datoria_latest_version -w "%{http_code}" \
+      --connect-timeout "${timeout_seconds}" \
+      --max-time $((timeout_seconds * 2)) \
+      "https://release.datoria.no/datoria/latest-release")
+
+    if [[ "${http_code}" -eq 200 ]]; then
+      latest_version=$(cat /tmp/datoria_latest_version)
+      if [[ -n "${latest_version}" ]]; then
+        debug_log "Latest version: ${latest_version}"
+        rm -f /tmp/datoria_latest_version
+        echo "${latest_version}"
+        return 0
+      fi
+    fi
+
+    debug_log "Failed to fetch latest version, attempt ${retry_count}. HTTP status: ${http_code}"
+    retry_count=$((retry_count + 1))
+    sleep 1
+  done
+
+  echo "Error: Failed to fetch latest version after ${max_retries} attempts. Please check your internet connection." >&2
+  rm -f /tmp/datoria_latest_version
+  exit 1
+}
+
+# Function to get platform-specific binary info
+get_platform_binary_info() {
+  local version="$1"
+  local platform
+  local arch
+  local binary_name=""
+  local extracted_binary_name="datoria"
+  local storage_path=""
+  local version_dir_path
+  local binary_path
+
+  platform=$(uname -s)
+  arch=$(uname -m)
+
+  if [[ "${platform}" == "Darwin" ]]; then
+    if [[ "${arch}" == "arm64" ]]; then
+      binary_name="datoria-arm64-apple-darwin.tar.gz"
+    else
+      binary_name="datoria-x86_64-apple-darwin.tar.gz"
+    fi
+    storage_path="${HOME}/Library/Caches/datoria"
+  elif [[ "${platform}" == "Linux" ]]; then
+    binary_name="datoria-x86_64-pc-linux.tar.gz"
+    if [[ -n "${XDG_CACHE_HOME}" ]]; then
+      storage_path="${XDG_CACHE_HOME}/datoria"
+    else
+      storage_path="${HOME}/.cache/datoria"
+    fi
+  else
+    echo "Unsupported platform: ${platform}" >&2
+    exit 1
+  fi
+
+  version_dir_path="${storage_path}/bins/v${version}"
+  binary_path="${version_dir_path}/${extracted_binary_name}"
+
+  debug_log "Binary name: ${binary_name}"
+  debug_log "Extracted binary name: ${extracted_binary_name}"
+  debug_log "Storage path: ${storage_path}"
+  debug_log "Version directory path: ${version_dir_path}"
+  debug_log "Binary path: ${binary_path}"
+
+  echo "binary_name=\"${binary_name}\""
+  echo "extracted_binary_name=\"${extracted_binary_name}\""
+  echo "storage_path=\"${storage_path}\""
+  echo "version_dir_path=\"${version_dir_path}\""
+  echo "binary_path=\"${version_dir_path}/${extracted_binary_name}\""
+}
+
+# Function to download and extract the binary
+download_binary() {
+  local version="$1"
+  local binary_name="$2"
+  local version_dir_path="$3"
+  local binary_path="$4"
+  local download_url
+  local archive_path
+  local timeout_seconds=60
+  local max_retries=3
+  local retry_count=0
+  local http_code
+
+  # Create directories if they don't exist
+  mkdir -p "${version_dir_path}"
+
+  download_url="https://release.datoria.no/datoria/v${version}/${binary_name}"
+  archive_path="${version_dir_path}/${binary_name}"
+
+  echo "Downloading Datoria binary version ${version}..."
+  debug_log "Download URL: ${download_url}"
+  debug_log "Archive path: ${archive_path}"
+
+  # Set a timeout for curl and validate HTTP status code
+  while [[ "${retry_count}" -lt "${max_retries}" ]]; do
+    http_code=$(curl -s -L -o "${archive_path}" -w "%{http_code}" \
+      --connect-timeout "${timeout_seconds}" \
+      --max-time $((timeout_seconds * 2)) \
+      "${download_url}")
+    
+    if [[ "${http_code}" -eq 200 ]]; then
+      if [[ ! -f "${archive_path}" || ! -s "${archive_path}" ]]; then
+        debug_log "Download appeared successful but file is empty or missing"
+        retry_count=$((retry_count + 1))
+        sleep 1
+        continue
+      fi
+      
+      # Extraction with error handling
+      echo "Extracting binary..."
+      if [[ "${binary_name}" == *.tar.gz ]]; then
+        if ! tar -xzf "${archive_path}" -C "${version_dir_path}"; then
+          echo "Error: Failed to extract archive ${archive_path}" >&2
+          rm -f "${archive_path}"
+          exit 1
+        fi
+      else
+        echo "Unsupported archive format: ${binary_name}" >&2
+        rm -f "${archive_path}"
+        exit 1
+      fi
+      
+      # Verify binary exists after extraction
+      if [[ ! -f "${binary_path}" ]]; then
+        echo "Error: Binary not found at expected path ${binary_path} after extraction" >&2
+        rm -f "${archive_path}"
+        exit 1
+      fi
+      
+      # Make binary executable
+      chmod +x "${binary_path}"
+      
+      # Clean up archive
+      rm -f "${archive_path}"
+      
+      echo "Successfully installed Datoria binary to ${binary_path}"
+      return 0
+    fi
+    
+    debug_log "Failed to download binary, attempt ${retry_count}. HTTP status: ${http_code}"
+    retry_count=$((retry_count + 1))
+    sleep 2
+  done
+  
+  echo "Error: Failed to download Datoria binary after ${max_retries} attempts. HTTP status: ${http_code}" >&2
+  exit 1
+}
+
+# Main logic
+main() {
+  local version=""
+  local config_file=""
+  
+  # Try to find config file, but handle the case where it's not found
+  config_file=$(find_config_file || true)
+  
+  if [[ -n "${config_file}" ]]; then
+    debug_log "Found config file: ${config_file}"
+    
+    # Try to extract version, but handle the case where it fails
+    if version=$(extract_version_from_config "${config_file}") && [[ -n "${version}" ]]; then
+      debug_log "Using version from config: ${version}"
+    else
+      debug_log "No version specified in config, using latest"
+      version=$(fetch_latest_version)
+    fi
+  else
+    debug_log "No config file found, using latest version"
+    version=$(fetch_latest_version)
+  fi
+  
+  # Read platform binary info
+  eval "$(get_platform_binary_info "${version}")"
+  
+  # Check if binary already exists
+  if [[ -f "${binary_path}" && -x "${binary_path}" ]]; then
+    debug_log "Using existing Datoria binary"
+  else
+    download_binary "${version}" "${binary_name}" "${version_dir_path}" "${binary_path}"
+  fi
+  
+  # Execute the binary with all passed arguments
+  debug_log "Launching Datoria with arguments:" "$@"
+  exec "${binary_path}" "$@"
+}
+
+main "$@"
